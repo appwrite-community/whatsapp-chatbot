@@ -1,0 +1,95 @@
+{
+    "projectId": "6aa803dc0007efbc5549",
+    "projectName": "WhatsApp Bot",
+    "endpoint": "https://fra.cloud.appwrite.io/v1",
+    "tablesDB": [
+        {
+            "$id": "6aa809b9002cb53eb86b",
+            "name": "WhatsApp Agent",
+            "enabled": true
+        }
+    ],
+    "tables": [
+        {
+            "$id": "conversations",
+            "$permissions": [],
+            "databaseId": "6aa809b9002cb53eb86b",
+            "name": "conversations",
+            "enabled": true,
+            "rowSecurity": false,
+            "columns": [
+                { "key": "phone", "type": "varchar", "size": 32, "required": true, "array": false },
+                { "key": "summary", "type": "text", "required": false, "array": false }
+            ],
+            "indexes": []
+        },
+        {
+            "$id": "messages",
+            "$permissions": [],
+            "databaseId": "6aa809b9002cb53eb86b",
+            "name": "messages",
+            "enabled": true,
+            "rowSecurity": false,
+            "columns": [
+                { "key": "phone", "type": "varchar", "size": 32, "required": true, "array": false },
+                { "key": "role", "type": "string", "format": "enum", "elements": ["user", "assistant"], "required": true, "array": false },
+                { "key": "content", "type": "text", "required": true, "array": false },
+                { "key": "wamid", "type": "varchar", "size": 128, "required": false, "array": false },
+                { "key": "compacted", "type": "boolean", "required": false, "array": false, "default": false }
+            ],
+            "indexes": [
+                { "key": "wamid_unique", "type": "unique", "columns": ["wamid"], "orders": ["ASC"] },
+                { "key": "phone_compacted", "type": "key", "columns": ["phone", "compacted"], "orders": ["ASC", "ASC"] }
+            ]
+        },
+        {
+            "$id": "orders",
+            "$permissions": [],
+            "databaseId": "6aa809b9002cb53eb86b",
+            "name": "orders",
+            "enabled": true,
+            "rowSecurity": false,
+            "columns": [
+                { "key": "orderNumber", "type": "varchar", "size": 32, "required": true, "array": false },
+                { "key": "items", "type": "varchar", "size": 255, "required": true, "array": false },
+                { "key": "status", "type": "string", "format": "enum", "elements": ["processing", "shipped", "delivered"], "required": true, "array": false },
+                { "key": "expectedDelivery", "type": "varchar", "size": 64, "required": false, "array": false }
+            ],
+            "indexes": [
+                { "key": "orderNumber_unique", "type": "unique", "columns": ["orderNumber"], "orders": ["ASC"] }
+            ]
+        }
+    ],
+    "functions": [
+        {
+            "$id": "whatsapp-webhook",
+            "name": "whatsapp-webhook",
+            "runtime": "node-22",
+            "execute": ["any"],
+            "enabled": true,
+            "logging": true,
+            "timeout": 15,
+            "entrypoint": "src/main.js",
+            "commands": "npm install",
+            "path": "functions/whatsapp-webhook",
+            "scopes": ["rows.write", "execution.write"],
+            "specification": "s-0.5vcpu-512mb",
+            "ignore": ["node_modules", ".npm"]
+        },
+        {
+            "$id": "whatsapp-agent",
+            "name": "whatsapp-agent",
+            "runtime": "node-22",
+            "execute": [],
+            "enabled": true,
+            "logging": true,
+            "timeout": 120,
+            "entrypoint": "src/main.js",
+            "commands": "npm install",
+            "path": "functions/whatsapp-agent",
+            "scopes": ["rows.read", "rows.write"],
+            "specification": "s-0.5vcpu-512mb",
+            "ignore": ["node_modules", ".npm"]
+        }
+    ]
+}
