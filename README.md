@@ -9,7 +9,7 @@ token threshold, and calls a tool to look up orders.
 | Path | Purpose |
 | --- | --- |
 | `functions/whatsapp-webhook` | Receives Meta webhooks, verifies the handshake, stores inbound messages, triggers the agent |
-| `functions/whatsapp-agent` | Loads history, compacts it when needed, calls Claude with a tool, sends the reply over WhatsApp |
+| `functions/whatsapp-agent` | Loads history, compacts it when needed, calls the model with a tool, sends the reply over WhatsApp |
 | `appwrite.config.json` | Tables, columns, indexes, and both functions for `appwrite push` |
 
 ## Setup
@@ -25,7 +25,8 @@ token threshold, and calls a tool to look up orders.
 | whatsapp-webhook | `WHATSAPP_VERIFY_TOKEN` | any random string, also pasted into Meta |
 | whatsapp-agent | `WHATSAPP_PHONE_NUMBER_ID` | from the Meta app's WhatsApp setup page |
 | whatsapp-agent | `WHATSAPP_TOKEN` | the WhatsApp access token |
-| whatsapp-agent | `ANTHROPIC_API_KEY` | your Anthropic API key |
+| whatsapp-agent | `OPENAI_API_KEY` | your OpenAI API key |
+| whatsapp-agent | `OPENAI_MODEL` | optional, default `gpt-5.6-luna` |
 | whatsapp-agent | `COMPACT_AFTER_TOKENS` | optional, default 1500 |
 
 4. In the Meta app, point the WhatsApp webhook at the webhook function's domain and subscribe to the `messages` field.

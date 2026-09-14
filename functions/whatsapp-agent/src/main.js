@@ -1,16 +1,15 @@
-import Anthropic from '@anthropic-ai/sdk';
-import { betaZodTool } from '@anthropic-ai/sdk/helpers/beta/zod';
+import OpenAI from 'openai';
 import { Client, ID, Query, TablesDB } from 'node-appwrite';
-import { z } from 'zod';
 
 const DATABASE_ID = process.env.DATABASE_ID;
 const MESSAGES_TABLE_ID = 'messages';
 const CONVERSATIONS_TABLE_ID = 'conversations';
 const ORDERS_TABLE_ID = 'orders';
 
-const MODEL = 'claude-opus-5';
-// When the uncompacted history grows past this many tokens, fold the older
-// part into the running summary. Small on purpose so the demo shows it happen.
+const MODEL = process.env.OPENAI_MODEL ?? 'gpt-5.6-luna';
+// When the prompt for the last reply used more than this many input tokens,
+// fold the older part of the history into the running summary before the
+// next reply. Small on purpose so the demo shows it happen.
 const COMPACT_AFTER_TOKENS = Number(process.env.COMPACT_AFTER_TOKENS ?? 1500);
 // Always keep this many recent messages verbatim after compaction.
 const KEEP_RECENT_MESSAGES = 6;
@@ -19,6 +18,23 @@ const SYSTEM_PROMPT = `You are the WhatsApp support assistant for Northwind Coff
 Answer in two or three short sentences, the way a person types on WhatsApp. No markdown.
 When a customer asks about an order, call the lookup_order tool with the order number
 before answering. Never invent order details. If you do not have an order number, ask for it.`;
+
+const TOOLS = [
+  {
+    type: 'function',
+    name: 'lookup_order',
+    description: 'Look up a Northwind Coffee order by its order number.',
+    strict: true,
+    parameters: {
+      type: 'object',
+      properties: {
+        orderNumber: { type: 'string', description: 'The order number, for example NW-1042' },
+      },
+      required: ['orderNumber'],
+      additionalProperties: false,
+    },
+  },
+];
 
 export default async ({ req, res, log, error }) => {
   const { phone } = req.bodyJson;
@@ -31,21 +47,19 @@ export default async ({ req, res, log, error }) => {
     .setProject(process.env.APPWRITE_FUNCTION_PROJECT_ID)
     .setKey(req.headers['x-appwrite-key'] ?? '');
   const tablesDB = new TablesDB(client);
-  const anthropic = new Anthropic();
+  const openai = new OpenAI();
 
   // 1. Load the running summary for this phone number, if there is one.
   const conversation = await getOrCreateConversation(tablesDB, phone);
 
   // 2. Load every message that has not been folded into the summary yet.
   let history = await loadUncompactedMessages(tablesDB, phone);
+  log(`Uncompacted history for ${phone}: ${history.length} messages, last prompt ${conversation.promptTokens ?? 0} tokens`);
 
-  // 3. Compact when the verbatim history is getting long.
-  const tokens = await countTokens(anthropic, conversation.summary, history);
-  log(`Uncompacted history for ${phone}: ${history.length} messages, ${tokens} tokens`);
-
-  if (tokens > COMPACT_AFTER_TOKENS && history.length > KEEP_RECENT_MESSAGES) {
+  // 3. Compact when the last prompt was getting long.
+  if ((conversation.promptTokens ?? 0) > COMPACT_AFTER_TOKENS && history.length > KEEP_RECENT_MESSAGES) {
     const older = history.slice(0, history.length - KEEP_RECENT_MESSAGES);
-    const summary = await summarize(anthropic, conversation.summary, older);
+    const summary = await summarize(openai, conversation.summary, older);
 
     await tablesDB.updateRow({
       databaseId: DATABASE_ID,
@@ -67,52 +81,31 @@ export default async ({ req, res, log, error }) => {
     log(`Compacted ${older.length} messages into the summary`);
   }
 
-  // 4. Ask the model. The tool runner handles the tool-call loop.
-  const lookupOrder = betaZodTool({
-    name: 'lookup_order',
-    description: 'Look up a Northwind Coffee order by its order number.',
-    inputSchema: z.object({
-      orderNumber: z.string().describe('The order number, for example NW-1042'),
-    }),
-    run: async ({ orderNumber }) => {
-      const result = await tablesDB.listRows({
-        databaseId: DATABASE_ID,
-        tableId: ORDERS_TABLE_ID,
-        queries: [Query.equal('orderNumber', orderNumber.toUpperCase()), Query.limit(1)],
-      });
-      if (result.total === 0) {
-        return `No order found with number ${orderNumber}.`;
-      }
-      const order = result.rows[0];
-      return JSON.stringify({
-        orderNumber: order.orderNumber,
-        items: order.items,
-        status: order.status,
-        expectedDelivery: order.expectedDelivery,
-      });
-    },
-  });
-
-  const system = conversation.summary
+  // 4. Ask the model, running any tool calls it asks for.
+  const instructions = conversation.summary
     ? `${SYSTEM_PROMPT}\n\nWhat you already know from earlier in this conversation:\n${conversation.summary}`
     : SYSTEM_PROMPT;
 
-  const finalMessage = await anthropic.beta.messages.toolRunner({
-    model: MODEL,
-    max_tokens: 1024,
-    system,
-    tools: [lookupOrder],
-    messages: history.map((row) => ({ role: row.role, content: row.content })),
-  });
+  const input = history.map((row) => ({ role: row.role, content: row.content }));
+  let response = await openai.responses.create({ model: MODEL, instructions, input, tools: TOOLS });
+  let promptTokens = response.usage?.input_tokens ?? 0;
 
-  const reply = finalMessage.content
-    .filter((block) => block.type === 'text')
-    .map((block) => block.text)
-    .join('\n')
-    .trim();
+  for (let round = 0; round < 5; round++) {
+    const calls = response.output.filter((item) => item.type === 'function_call');
+    if (calls.length === 0) break;
 
+    input.push(...response.output);
+    for (const call of calls) {
+      const output = await runTool(tablesDB, call.name, JSON.parse(call.arguments));
+      input.push({ type: 'function_call_output', call_id: call.call_id, output });
+    }
+    response = await openai.responses.create({ model: MODEL, instructions, input, tools: TOOLS });
+    promptTokens = Math.max(promptTokens, response.usage?.input_tokens ?? 0);
+  }
+
+  const reply = response.output_text.trim();
   if (!reply) {
-    error(`Model returned no text for ${phone} (stop_reason: ${finalMessage.stop_reason})`);
+    error(`Model returned no text for ${phone} (status: ${response.status})`);
     return res.json({ ok: false });
   }
 
@@ -126,8 +119,37 @@ export default async ({ req, res, log, error }) => {
     data: { phone, role: 'assistant', content: reply, wamid, compacted: false },
   });
 
-  return res.json({ ok: true, tokens, compacted: conversation.summary !== null });
+  // Remember how big the prompt was so the next run knows whether to compact.
+  await tablesDB.updateRow({
+    databaseId: DATABASE_ID,
+    tableId: CONVERSATIONS_TABLE_ID,
+    rowId: conversation.$id,
+    data: { promptTokens },
+  });
+
+  return res.json({ ok: true, promptTokens, compacted: conversation.summary !== null });
 };
+
+async function runTool(tablesDB, name, args) {
+  if (name !== 'lookup_order') {
+    return `Unknown tool ${name}`;
+  }
+  const result = await tablesDB.listRows({
+    databaseId: DATABASE_ID,
+    tableId: ORDERS_TABLE_ID,
+    queries: [Query.equal('orderNumber', args.orderNumber.toUpperCase()), Query.limit(1)],
+  });
+  if (result.total === 0) {
+    return `No order found with number ${args.orderNumber}.`;
+  }
+  const order = result.rows[0];
+  return JSON.stringify({
+    orderNumber: order.orderNumber,
+    items: order.items,
+    status: order.status,
+    expectedDelivery: order.expectedDelivery,
+  });
+}
 
 async function getOrCreateConversation(tablesDB, phone) {
   try {
@@ -142,7 +164,7 @@ async function getOrCreateConversation(tablesDB, phone) {
       databaseId: DATABASE_ID,
       tableId: CONVERSATIONS_TABLE_ID,
       rowId: phone,
-      data: { phone, summary: null },
+      data: { phone, summary: null, promptTokens: 0 },
     });
   }
 }
@@ -161,41 +183,21 @@ async function loadUncompactedMessages(tablesDB, phone) {
   return result.rows;
 }
 
-async function countTokens(anthropic, summary, history) {
-  if (history.length === 0) return 0;
-  const result = await anthropic.messages.countTokens({
-    model: MODEL,
-    system: summary ?? undefined,
-    messages: history.map((row) => ({ role: row.role, content: row.content })),
-  });
-  return result.input_tokens;
-}
-
-async function summarize(anthropic, previousSummary, rows) {
+async function summarize(openai, previousSummary, rows) {
   const transcript = rows
     .map((row) => `${row.role === 'user' ? 'Customer' : 'Assistant'}: ${row.content}`)
     .join('\n');
 
-  const response = await anthropic.messages.create({
+  const response = await openai.responses.create({
     model: MODEL,
-    max_tokens: 1024,
-    system:
+    instructions:
       'You maintain a compact memory of a customer support conversation. Merge the existing summary ' +
       'with the new transcript into one plain-text summary under 200 words. Keep names, order numbers, ' +
       'preferences, unresolved questions, and promises made. Drop greetings and small talk.',
-    messages: [
-      {
-        role: 'user',
-        content: `Existing summary:\n${previousSummary ?? '(none)'}\n\nNew transcript:\n${transcript}`,
-      },
-    ],
+    input: `Existing summary:\n${previousSummary ?? '(none)'}\n\nNew transcript:\n${transcript}`,
   });
 
-  return response.content
-    .filter((block) => block.type === 'text')
-    .map((block) => block.text)
-    .join('\n')
-    .trim();
+  return response.output_text.trim();
 }
 
 async function sendWhatsAppMessage(to, text) {
